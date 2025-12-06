@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY . /app
+
+RUN apt-get update && apt-get install -y git \
+    && pip install --no-cache-dir streamlit plotly pandas requests kaleido \
+    && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+
+ENV STREAMLIT_SERVER_HEADLESS=true
+ENV STREAMLIT_SERVER_ENABLECORS=false
+ENV STREAMLIT_SERVER_PORT=8501
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "ui/streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0"]

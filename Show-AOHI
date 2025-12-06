@@ -1,0 +1,20 @@
+function Show-AOHI {
+  param([string]$endpoint="incidents")
+  $obj = Invoke-RestMethod "http://127.0.0.1:8000/$endpoint"
+  if($obj.incidents) {
+    $obj.incidents | ForEach-Object {
+      [pscustomobject]@{
+        Bucket     = $_.incident_bucket
+        DetectedBy = ($_.detected_by -join ", ")
+        RootCauses = ($_.root_causes | ForEach-Object { "$($_.name): $($_.description)" }) -join " | "
+        Playbooks  = ($_.playbooks | ForEach-Object { "$($_.owner)[$($_.priority)] - $($_.steps)" }) -join " ; "
+      }
+    } | Format-Table -AutoSize
+  } else {
+    $obj | Format-List *
+  }
+}
+# Usage:
+Show-AOHI
+# or
+Show-AOHI rca

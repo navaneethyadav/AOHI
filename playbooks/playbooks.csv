@@ -1,0 +1,6 @@
+root_cause,priority,owner,steps
+payment_gateway_latency,high,site-reliability,1) Check payment gateway logs; 2) Rollback any recent deploy; 3) Restart payment workers; 4) Notify SRE on-call
+support_surge,medium,customer-success,1) Open support incident; 2) Inform customers; 3) Escalate to engineering; 4) Monitor complaints
+failed_tx_spike,high,ops,1) Check payment gateway; 2) Inspect transaction failures; 3) Retry queued payments; 4) Notify engineering
+revenue_drop,high,product,1) Check checkout logs; 2) Verify payment gateway; 3) Monitor refunds
+geo_failure,medium,ops,1) Check regional gateway; 2) Validate IP/CDN; 3) Notify regional SRE

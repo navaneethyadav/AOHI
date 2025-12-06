@@ -1,0 +1,6 @@
+﻿.venv/
+data/*.pdf
+data/reports/
+__pycache__/
+*.pyc
+.env

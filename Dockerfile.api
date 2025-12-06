@@ -1,0 +1,13 @@
+# Dockerfile.api (excerpt)
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY . /app
+
+RUN apt-get update && apt-get install -y build-essential \
+    && pip install --no-cache-dir reportlab plotly kaleido requests pandas numpy scipy statsmodels \
+    && pip install --no-cache-dir -r requirements.txt || true \
+    && apt-get remove -y build-essential && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+
+EXPOSE 8000
+CMD ["uvicorn", "api.fastapi_app:app", "--host", "0.0.0.0", "--port", "8000"]

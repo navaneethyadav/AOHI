@@ -1,0 +1,21 @@
+{
+  "payment_gateway_latency": {
+    "description": "Latency spike in system metrics around the incident window (likely payment gateway or service degradation).",
+    "metric": "latency_ms",
+    "type": "increase_factor",
+    "factor": 1.5,
+    "min_count": 5
+  },
+  "support_surge": {
+    "description": "Large number of support tickets around the incident window (user-facing issue).",
+    "metric": "support_ticket",
+    "type": "count_increase",
+    "threshold": 8
+  },
+  "failed_tx_spike": {
+    "description": "Large spike in failed transactions detected by anomaly detectors.",
+    "metric": "failed_count",
+    "type": "absolute_threshold",
+    "threshold": 10
+  }
+}
