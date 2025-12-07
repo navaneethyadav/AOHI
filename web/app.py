@@ -1,12 +1,11 @@
-# web/app.py
 import streamlit as st
 import requests
 import json
 
+# No secrets needed for local dashboard
 API_BASE = "http://127.0.0.1:8000"
 
 st.set_page_config(page_title="AOHI Dashboard", layout="wide")
-st.title("AOHI Dashboard (Streamlit)")
 
 col1, col2, col3 = st.columns(3)
 

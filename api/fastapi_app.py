@@ -1,230 +1,248 @@
-# api/fastapi_app.py
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse, FileResponse
-from fastapi.middleware.cors import CORSMiddleware
+"""
+FastAPI backend for AOHI (Adaptive Operational Health Intelligence).
 
-import subprocess
+Exposes:
+    - /health         : basic API health check
+    - /incidents      : run all detectors and return incidents JSON
+    - /rca            : simple rule-based RCA on top of incidents
+    - /report_pro     : generate a PDF report using generate_report_pro.py
+"""
+
+from __future__ import annotations
+
+import logging
 import sys
-import traceback
 from pathlib import Path
+from subprocess import run
 from typing import Any, Dict, List
-import json
-import math
-import os
-import importlib
-import time
 
-# Project root and data locations (adjust if your layout differs)
-ROOT = Path(__file__).resolve().parents[1]  # project root
-DATA_DIR = ROOT / "data"
-REPORT_SCRIPT = ROOT / "api" / "generate_report_pro.py"
-REPORT_OUTPUT_DEFAULT = DATA_DIR / "AOHI_FromAPI.pdf"
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 
-# Create data dir if missing
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# --- Detectors ---
+from detectors import ewma, geo, latency, revenue, seasonal_zscore
+from detectors import run_all_detectors, run_extra_detectors
 
-app = FastAPI(title="AOHI", version="0.1")
+# -------------------------------------------------------------------
+# Basic app setup
+# -------------------------------------------------------------------
 
-# allow the Vite dev server(s) to call the API (dev)
+app = FastAPI(
+    title="AOHI API",
+    version="0.1",
+    description="AOHI (Adaptive Operational Health Intelligence) backend API",
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173", "http://127.0.0.1:5173",
-        "http://localhost:5174", "http://127.0.0.1:5174"
-    ],
+    allow_origins=["*"],  # fine for local dev
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+logger = logging.getLogger("aohi.api")
+logger.setLevel(logging.INFO)
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+TRANSACTIONS_CSV = DATA_DIR / "transactions.csv"
+
+
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+
 def sanitize_for_json(obj: Any) -> Any:
     """
-    Convert values that JSON can't handle (NaN, inf, complex objects) into
-    safe serializable values (strings or smaller structures).
+    Convert values coming from detectors into JSON-safe types.
+    Keeps "inf" as string if needed.
     """
-    try:
-        if obj is None:
-            return None
-        if isinstance(obj, (str, bool, int)):
-            return obj
-        if isinstance(obj, float):
-            if math.isfinite(obj):
-                return obj
-            return str(obj)  # "inf", "-inf", "nan"
-        if isinstance(obj, dict):
-            return {str(k): sanitize_for_json(v) for k, v in obj.items()}
-        if isinstance(obj, (list, tuple, set)):
-            return [sanitize_for_json(v) for v in obj]
-        if isinstance(obj, Path):
-            return str(obj)
+    import numpy as np
+    import pandas as pd
+
+    if obj is None:
+        return None
+
+    if hasattr(obj, "isoformat"):
         try:
-            import datetime
-            if isinstance(obj, datetime.datetime):
-                return obj.isoformat()
+            return obj.isoformat()
         except Exception:
             pass
+
+    if isinstance(obj, (np.generic, pd.Timestamp)):
         try:
-            json.dumps(obj)
-            return obj
+            return obj.item()
         except Exception:
             return str(obj)
-    except Exception:
-        return "<unserializable>"
 
-@app.get("/")
-def root():
-    return {"detail": "AOHI API - available endpoints: /health, /incidents, /rca, /report_pro"}
+    if isinstance(obj, (list, tuple)):
+        return [sanitize_for_json(x) for x in obj]
+
+    if isinstance(obj, dict):
+        return {str(k): sanitize_for_json(v) for k, v in obj.items()}
+
+    return obj
+
+
+def run_all_incident_detectors() -> Dict[str, Any]:
+    """
+    Call all detector functions and bundle their results.
+    """
+    if not TRANSACTIONS_CSV.exists():
+        raise FileNotFoundError(f"Transactions CSV not found at {TRANSACTIONS_CSV}")
+
+    csv_path = str(TRANSACTIONS_CSV)
+    incidents: List[Dict[str, Any]] = []
+
+    def add_detector(name: str, func):
+        try:
+            raw_result = func(csv_path)
+            incidents.append(
+                {
+                    "detector": name,
+                    "result": sanitize_for_json(raw_result),
+                }
+            )
+        except Exception as e:
+            # Don't crash whole API if one detector fails
+            logger.warning("Detector %s failed: %s", name, e)
+
+    # Base detectors
+    add_detector("detectors.ewma.detect_ewma_failed", ewma.detect_ewma_failed)
+    add_detector("detectors.geo.detect_geo_failures", geo.detect_geo_failures)
+    add_detector("detectors.latency.detect_latency_spike", latency.detect_latency_spike)
+    add_detector("detectors.revenue.detect_revenue_drop", revenue.detect_revenue_drop)
+    add_detector(
+        "detectors.seasonal_zscore.detect_failed_tx_spike",
+        seasonal_zscore.detect_failed_tx_spike,
+    )
+
+    # Meta-detectors
+    add_detector(
+        "detectors.run_all_detectors.detect_ewma_failed",
+        run_all_detectors.detect_ewma_failed,
+    )
+    add_detector(
+        "detectors.run_extra_detectors.detect_geo_failures",
+        run_extra_detectors.detect_geo_failures,
+    )
+
+    return {"incidents": incidents}
+
+
+def compute_simple_rca(incidents: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Very small rule-based RCA engine.
+    """
+    results: List[Dict[str, Any]] = []
+    detectors_used: List[str] = []
+
+    inc_list = incidents.get("incidents", [])
+
+    for item in inc_list:
+        name = item.get("detector")
+        if name:
+            detectors_used.append(name)
+
+    # Rule: many geo failures in IN => regional failure in IN
+    geo_items = [
+        inc for inc in inc_list if inc.get("detector") == "detectors.geo.detect_geo_failures"
+    ]
+    total_obs = 0
+    country = None
+
+    if geo_items:
+        for row in geo_items[0].get("result", []):
+            if row.get("country") == "IN":
+                country = "IN"
+                total_obs += 1
+
+    if country and total_obs > 0:
+        results.append(
+            {
+                "root_cause": "Regional failures in IN",
+                "confidence": 0.9,
+                "evidence": {
+                    "country": country,
+                    "observations": total_obs,
+                },
+                "recommendation": "Investigate services in IN, check network, CDN, and regional gateways.",
+            }
+        )
+
+    return {
+        "results": {
+            "results": results,
+            "detectors_used": detectors_used,
+        }
+    }
+
+
+# -------------------------------------------------------------------
+# Endpoints
+# -------------------------------------------------------------------
 
 @app.get("/health")
-def health():
+def health() -> Dict[str, Any]:
     return {"status": "ok", "service": "AOHI", "version": "0.1"}
 
-def discover_detectors() -> List[str]:
-    dets = []
-    detectors_dir = ROOT / "detectors"
-    if not detectors_dir.exists():
-        return dets
-    for p in detectors_dir.glob("*.py"):
-        if p.name.startswith("__"):
-            continue
-        module_name = f"detectors.{p.stem}"
-        dets.append(module_name)
-    dets.sort()
-    return dets
-
-def safe_call_detector(func, module_name: str) -> Dict[str, Any]:
-    out = {"detector": module_name}
-    try:
-        try:
-            res = func()
-        except TypeError:
-            # try module CSV_PATH if present
-            try:
-                mod = importlib.import_module(func.__module__)
-                csv_path = getattr(mod, "CSV_PATH", None)
-            except Exception:
-                csv_path = None
-            if not csv_path:
-                default = DATA_DIR / "transactions.csv"
-                csv_path = str(default) if default.exists() else None
-            if csv_path:
-                res = func(csv_path)
-            else:
-                # last resort: pass data dir path
-                res = func(str(DATA_DIR))
-        out["result"] = sanitize_for_json(res)
-    except Exception as e:
-        out["error"] = "runtime error: " + str(e)
-        out["traceback"] = traceback.format_exc()
-    return out
-
-def run_detector_function(module_name: str) -> Dict[str, Any]:
-    data = {"detector": module_name}
-    try:
-        mod = importlib.import_module(module_name)
-        func = None
-        chosen_name = None
-        for attr in dir(mod):
-            if attr.startswith("detect_") and callable(getattr(mod, attr)):
-                func = getattr(mod, attr)
-                chosen_name = attr
-                break
-        if func is None and hasattr(mod, "detect") and callable(getattr(mod, "detect")):
-            func = getattr(mod, "detect")
-            chosen_name = "detect"
-        if func is None:
-            data["error"] = "no detect function found"
-            return data
-        data["detector"] = f"{module_name}.{chosen_name}"
-        return safe_call_detector(func, data["detector"])
-    except Exception as e:
-        data["error"] = "import/runtime error: " + str(e)
-        data["traceback"] = traceback.format_exc()
-    return data
-
-@app.get("/run_detectors")
-def run_detectors(force: bool = Query(False)):
-    modules = discover_detectors()
-    out = []
-    for module in modules:
-        info = run_detector_function(module)
-        out.append(info)
-    return {"detectors": sanitize_for_json(out)}
 
 @app.get("/incidents")
-def incidents(force_run: bool = Query(False)):
+def get_incidents(force_run: bool = Query(False)) -> JSONResponse:
     try:
-        d = run_detectors(force=force_run)
-        return {"incidents": d.get("detectors", [])}
-    except Exception:
-        return JSONResponse(content={"detail": "Internal error running detectors", "traceback": traceback.format_exc()}, status_code=500)
+        payload = run_all_incident_detectors()
+        return JSONResponse(payload)
+    except Exception as e:
+        logger.exception("Failed to compute incidents: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to compute incidents: {e}")
+
 
 @app.get("/rca")
-def rca():
+def get_rca() -> JSONResponse:
     try:
-        try:
-            import rca_engine.engine as engine
-            if hasattr(engine, "analyze") and callable(engine.analyze):
-                results = engine.analyze()
-                return {"results": sanitize_for_json(results)}
-            else:
-                detectors_out = run_detectors()
-                return {"detail": "RCA fallback results", "results": detectors_out.get("detectors", [])}
-        except ModuleNotFoundError:
-            detectors_out = run_detectors()
-            return {"detail": "RCA fallback results", "results": detectors_out.get("detectors", [])}
-    except Exception:
-        return JSONResponse(content={"detail": "RCA failed", "traceback": traceback.format_exc()}, status_code=500)
+        incidents = run_all_incident_detectors()
+        rca_payload = compute_simple_rca(incidents)
+        return JSONResponse(rca_payload)
+    except Exception as e:
+        logger.exception("Failed to compute RCA: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to compute RCA: {e}")
+
 
 @app.get("/report_pro")
-def report_pro(force: bool = Query(False), timeout: int = Query(30), name: str = Query("AOHI"), api: str = Query("http://127.0.0.1:8000/rca")):
-    # check script
-    if not REPORT_SCRIPT.exists():
-        return JSONResponse(content={"detail": "Report generator not found", "path": str(REPORT_SCRIPT)}, status_code=500)
-
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = REPORT_OUTPUT_DEFAULT
-
-    # If force is requested, remove existing output file before running the generator.
-    if force and out_path.exists():
-        try:
-            out_path.unlink()
-            time.sleep(0.05)
-        except Exception:
-            pass
-
-    # Build command (NOTE: do NOT pass --force to the script)
-    cmd = [sys.executable, str(REPORT_SCRIPT), "--out", str(out_path), "--name", name, "--api", api]
+def generate_report(timeout: int = 60, name: str = "AOHI User"):
+    """
+    Generate AOHI report by calling the local script generate_report_pro.py
+    and then return the PDF file.
+    """
+    out_path = DATA_DIR / "AOHI_Final_Report.pdf"
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=str(ROOT))
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
-        rc = proc.returncode
+        # 🔧 IMPORTANT: use the SAME Python as FastAPI (your venv),
+        # not the global "python" that doesn't have pandas installed.
+        run(
+            [
+                sys.executable,        # <--- main fix
+                "-m",
+                "api.generate_report_pro",
+                "--out",
+                str(out_path),
+                "--name",
+                name,
+            ],
+            timeout=timeout,
+            check=True,
+        )
+    except Exception as e:
+        logger.exception("Failed to generate report: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to generate report: {e}")
 
-        data_files = []
-        try:
-            for p in sorted(DATA_DIR.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
-                data_files.append({"name": p.name, "size": p.stat().st_size, "mtime": p.stat().st_mtime})
-        except Exception:
-            data_files = ["unable to list data dir", traceback.format_exc()]
+    if not out_path.exists():
+        raise HTTPException(status_code=500, detail="Report file was not created.")
 
-        if out_path.exists():
-            return FileResponse(path=str(out_path), media_type="application/pdf", filename=out_path.name)
-        else:
-            return JSONResponse(
-                content=sanitize_for_json({
-                    "detail": "Report written but PDF not found at expected path",
-                    "expected_path": str(out_path),
-                    "returncode": rc,
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "data_dir_listing": data_files,
-                    "cwd_used": str(ROOT),
-                }),
-                status_code=500,
-            )
-    except subprocess.TimeoutExpired as ex:
-        return JSONResponse(content={"detail": "Report generator timed out", "timeout": timeout, "error": str(ex)}, status_code=500)
-    except Exception:
-        return JSONResponse(content=sanitize_for_json({"detail": "Report generator failed", "traceback": traceback.format_exc()}), status_code=500)
+    return FileResponse(
+        str(out_path),
+        media_type="application/pdf",
+        filename="AOHI_Final_Report.pdf",
+    )

@@ -1,178 +1,206 @@
-# api/generate_report_pro.py
-"""
-Simple professional report generator for AOHI.
-Usage:
-  python api/generate_report_pro.py --out ../data/AOHI_Final_Report.pdf --name "Your Name" --api http://127.0.0.1:8000/rca
-"""
-
 import argparse
-import json
-from pathlib import Path
-import sys
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from datetime import datetime
+
+import pandas as pd
+import requests
+
+from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.lib.utils import ImageReader
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
-# Optional requests (only used if --api provided)
-try:
-    import requests
-except Exception:
-    requests = None
+API_BASE = "http://127.0.0.1:8000"
 
-ROOT = Path(__file__).parent.parent.resolve()
-DATA_DIR = ROOT / "data"
-DEFAULT_LOGO_PNG = DATA_DIR / "aohi_logo.png"
 
-def load_rca_from_api(api_url: str):
-    if requests is None:
-        raise RuntimeError("requests library not available to call API")
-    r = requests.get(api_url, timeout=10)
-    r.raise_for_status()
-    return r.json()
+# -----------------------------
+# API CALLS
+# -----------------------------
 
-def load_local_rca():
-    # prefer rca_saved.json or incidents_full.json
-    candidates = [DATA_DIR / "rca.json", DATA_DIR / "incidents_full.json", DATA_DIR / "incidents.json"]
-    for p in candidates:
-        if p.exists():
-            try:
-                return json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-    return {"rca": []}
+def get_live_incidents():
+    """Fetch fresh incidents from AOHI API with force_run=True."""
+    resp = requests.get(
+        f"{API_BASE}/incidents",
+        params={"force_run": "true"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
-def add_logo_to_story(story, styles, logo_path):
-    # add a small logo if PNG is available; ImageReader handles PNG/JPEG.
-    if logo_path.exists():
-        try:
-            ir = ImageReader(str(logo_path))
-            img = Image(ir, width=80*mm, height=24*mm)
-            story.append(img)
-            story.append(Spacer(1, 6))
-            return
-        except Exception:
-            # fallthrough to text title
-            pass
-    # fallback: text title
-    story.append(Paragraph("<b>AOHI - Adaptive Operational Health Intelligence</b>", styles["Title"]))
-    story.append(Spacer(1, 6))
 
-def build_pdf(out_path: Path, name: str = None, api_url: str = None):
+def get_live_rca():
+    """Fetch RCA from AOHI API."""
+    resp = requests.get(f"{API_BASE}/rca", timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# -----------------------------
+# FLATTEN INCIDENTS
+# -----------------------------
+
+def flatten_incidents(inc_json):
+    """Convert incidents JSON into a pandas DataFrame."""
+    rows = []
+
+    for det in inc_json.get("incidents", []):
+        det_name = det.get("detector", "")
+        for r in det.get("result", []):
+            rows.append(
+                {
+                    "timestamp": r.get("timestamp"),
+                    "detector": det_name,
+                    "failed": r.get("failed", ""),
+                    "failed_count": r.get("failed_count", ""),
+                    "zscore": str(r.get("zscore", "")),
+                    "current_revenue": r.get("current_revenue", ""),
+                    "baseline": r.get("baseline", ""),
+                    "country": r.get("country", ""),
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
+    return df
+
+
+# -----------------------------
+# BUILD PDF
+# -----------------------------
+
+def build_report(out_file: str, name: str) -> None:
+    """Generate AOHI PDF report using live API data."""
+    try:
+        inc_json = get_live_incidents()
+    except Exception as e:
+        inc_json = {}
+        print(f"[WARN] Failed to fetch incidents: {e}")
+
+    try:
+        rca_json = get_live_rca()
+    except Exception as e:
+        rca_json = {}
+        print(f"[WARN] Failed to fetch RCA: {e}")
+
+    df = flatten_incidents(inc_json)
+
     styles = getSampleStyleSheet()
-    # Avoid duplicate style error
-    if "Code" not in styles.byName:
-        styles.add(ParagraphStyle(name="Code", fontName="Courier", fontSize=8, leading=10))
-
-    doc = SimpleDocTemplate(str(out_path), pagesize=A4, rightMargin=20*mm, leftMargin=20*mm, topMargin=20*mm, bottomMargin=20*mm)
     story = []
 
-    # Logo or title
-    add_logo_to_story(story, styles, DEFAULT_LOGO_PNG)
+    # Title + header
+    story.append(Paragraph("AOHI - Adaptive Operational Health Intelligence", styles["Title"]))
+    story.append(Spacer(1, 10))
+    story.append(Paragraph(f"Prepared for: <b>{name}</b>", styles["Normal"]))
+    story.append(Paragraph(f"Generated: <b>{datetime.now()}</b>", styles["Normal"]))
+    story.append(Spacer(1, 15))
 
-    # Header
-    if name:
-        story.append(Paragraph(f"<b>Prepared for:</b> {name}", styles["Normal"]))
-    story.append(Paragraph(f"<b>Generated:</b> {Path().resolve().name}", styles["Normal"]))
-    story.append(Spacer(1, 12))
+    # Section 1 — Overview
+    story.append(Paragraph("Section 1 — Overview", styles["Heading2"]))
+    story.append(Paragraph(f"• Total incident records: {len(df)}", styles["Normal"]))
 
-    # Load RCA/incidents
-    rca_data = None
-    if api_url:
-        try:
-            rca_data = load_rca_from_api(api_url)
-        except Exception as e:
-            # fallback to local
-            rca_data = None
+    if not df.empty:
+        detectors_str = ", ".join(sorted(df["detector"].dropna().unique()))
+        story.append(Paragraph(f"• Detectors involved: {detectors_str}", styles["Normal"]))
 
-    if rca_data is None:
-        rca_data = load_local_rca()
-
-    # rca_data structure may vary. Try to normalize
-    items = []
-    if isinstance(rca_data, dict):
-        # if top-level has 'rca' or 'incidents' keys
-        if "rca" in rca_data and isinstance(rca_data["rca"], list):
-            items = rca_data["rca"]
-        elif "incidents" in rca_data and isinstance(rca_data["incidents"], list):
-            items = rca_data["incidents"]
-        else:
-            # maybe it's already a list-like dict (single entry)
-            # try to convert dict->list
-            items = [rca_data]
-    elif isinstance(rca_data, list):
-        items = rca_data
+        t_min = df["timestamp"].min()
+        t_max = df["timestamp"].max()
+        story.append(
+            Paragraph(
+                f"• Time range (incidents): {t_min} → {t_max}",
+                styles["Normal"],
+            )
+        )
     else:
-        items = [rca_data]
+        story.append(Paragraph("• Detectors involved: N/A", styles["Normal"]))
+        story.append(Paragraph("• Time range (incidents): N/A", styles["Normal"]))
 
-    if len(items) == 0:
-        story.append(Paragraph("No incidents or RCA data found.", styles["Normal"]))
+    story.append(Spacer(1, 15))
+
+    # Section 2 — Incident Summary
+    story.append(Paragraph("Section 2 — Incident Summary", styles["Heading2"]))
+
+    if df.empty:
+        story.append(Paragraph("No incidents available.", styles["Normal"]))
     else:
-        # Render items with simple formatting
-        for idx, it in enumerate(items, start=1):
-            story.append(Paragraph(f"<b>Incident #{idx}</b>", styles["Heading3"]))
-            # if item contains 'incident_bucket' / 'detected_by' / 'root_causes' etc (your format)
-            if isinstance(it, dict):
-                # show bucket/time if present
-                if it.get("incident_bucket"):
-                    story.append(Paragraph(f"<b>Bucket:</b> {it.get('incident_bucket')}", styles["Normal"]))
-                # detected_by
-                det = it.get("detected_by") or it.get("detector") or it.get("payload", {}).get("detector")
-                if det:
-                    if isinstance(det, (list, tuple)):
-                        det_str = ", ".join(map(str, det))
-                    else:
-                        det_str = str(det)
-                    story.append(Paragraph(f"<b>Detected by:</b> {det_str}", styles["Normal"]))
-                # root_causes
-                rcs = it.get("root_causes") or it.get("payload", {}).get("root_causes")
-                if rcs and isinstance(rcs, list):
-                    for rc in rcs:
-                        rc_name = rc.get("root_cause", rc.get("root_cause", "root_cause"))
-                        desc = rc.get("description", "")
-                        evidence = rc.get("evidence", {})
-                        story.append(Paragraph(f"<b>Root cause:</b> {rc_name}", styles["Normal"]))
-                        story.append(Paragraph(str(desc), styles["Code"]))
-                        if evidence:
-                            story.append(Paragraph(f"<b>Evidence:</b> {json.dumps(evidence, default=str)}", styles["Code"]))
-                # payload fallback
-                payload = it.get("payload")
-                if payload and not rcs:
-                    story.append(Paragraph(f"{json.dumps(payload, default=str)}", styles["Code"]))
-            else:
-                story.append(Paragraph(str(it), styles["Normal"]))
-            story.append(Spacer(1, 8))
+        table_data = [
+            [
+                "Timestamp",
+                "Detector",
+                "Country",
+                "Failed/Failed_Count",
+                "Z-Score",
+                "Revenue",
+                "Baseline",
+            ]
+        ]
 
-    # Footer / metadata
-    story.append(Spacer(1, 12))
-    story.append(Paragraph("End of report", styles["Normal"]))
+        for _, r in df.iterrows():
+            table_data.append(
+                [
+                    str(r["timestamp"]),
+                    r.get("detector", ""),
+                    r.get("country", ""),
+                    f"{r.get('failed', '')}/{r.get('failed_count', '')}",
+                    r.get("zscore", ""),
+                    str(r.get("current_revenue", "")),
+                    str(r.get("baseline", "")),
+                ]
+            )
 
-    # Create parent directory if needed
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+        table = Table(table_data, repeatRows=1)
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ]
+            )
+        )
+        story.append(table)
 
-    # Build PDF
+    story.append(Spacer(1, 20))
+
+    # Section 3 — RCA
+    story.append(Paragraph("Section 3 — Root Cause Analysis (RCA)", styles["Heading2"]))
+
+    rca_list = rca_json.get("results", {}).get("results", []) if rca_json else []
+
+    if not rca_list:
+        story.append(Paragraph("No RCA results available.", styles["Normal"]))
+    else:
+        for idx, r in enumerate(rca_list, start=1):
+            story.append(Paragraph(f"Root Cause #{idx}: {r.get('root_cause', '')}", styles["Normal"]))
+            story.append(Paragraph(f"Confidence: {r.get('confidence', '')}", styles["Normal"]))
+            story.append(Paragraph(f"Recommendation: {r.get('recommendation', '')}", styles["Normal"]))
+
+            evidence = r.get("evidence", {})
+            if evidence:
+                story.append(Paragraph(f"Evidence: {evidence}", styles["Normal"]))
+            story.append(Spacer(1, 10))
+
+    story.append(Spacer(1, 20))
+    story.append(Paragraph("End of report.", styles["Normal"]))
+
+    doc = SimpleDocTemplate(out_file, pagesize=A4)
     doc.build(story)
 
 
-def main():
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", required=True, help="Output PDF path")
-    parser.add_argument("--name", required=False, help="Optional report name")
-    parser.add_argument("--api", required=False, help="Optional RCA API URL to fetch data (e.g. http://127.0.0.1:8000/rca)")
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--name", required=True)
     args = parser.parse_args()
 
-    out_path = Path(args.out).resolve()
-    try:
-        build_pdf(out_path, name=args.name, api_url=args.api)
-        print(f"Report written to {out_path}")
-        sys.exit(0)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print(f"ERROR: {str(e)}", file=sys.stderr)
-        sys.exit(2)
-
-
-if __name__ == "__main__":
-    main()
+    build_report(args.out, args.name)
