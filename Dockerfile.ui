@@ -1,17 +1,22 @@
+# Frontend / Streamlit UI image
 FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/requirements.txt
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy entire project (we need ui/, data/, api/, detectors/, etc.)
 COPY . /app
-
-RUN apt-get update && apt-get install -y git \
-    && pip install --no-cache-dir streamlit plotly pandas requests kaleido \
-    && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
-
-ENV STREAMLIT_SERVER_HEADLESS=true
-ENV STREAMLIT_SERVER_ENABLECORS=false
-ENV STREAMLIT_SERVER_PORT=8501
 
 EXPOSE 8501
 
-CMD ["streamlit", "run", "ui/streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD ["streamlit", "run", "ui/dashboard.py", "--server.port=8501", "--server.address=0.0.0.0"]

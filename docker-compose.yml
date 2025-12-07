@@ -1,29 +1,37 @@
-version: "3.9"
-
 services:
   api:
+    container_name: aohi-api
     build:
       context: .
       dockerfile: Dockerfile.api
-    container_name: aohi_api
     ports:
       - "8000:8000"
+    working_dir: /app
     volumes:
-      - ./data:/app/data:rw
-      - ./playbooks:/app/playbooks:rw
+      - .:/app
     environment:
-      - AOHI_ENV=production
+      - PYTHONUNBUFFERED=1
+    command: >
+      uvicorn api.fastapi_app:app
+      --host 0.0.0.0
+      --port 8000
 
   ui:
+    container_name: aohi-ui
     build:
       context: .
       dockerfile: Dockerfile.ui
-    container_name: aohi_ui
     ports:
       - "8501:8501"
+    working_dir: /app
     depends_on:
       - api
     environment:
-      - API_URL=http://api:8000
-    volumes:
-      - ./data:/app/data:rw
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      # UI will call the API container by its service name "api"
+      - AOHI_API_BASE=http://api:8000
+    command: >
+      streamlit run ui/dashboard.py
+      --server.port=8501
+      --server.address=0.0.0.0

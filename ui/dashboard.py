@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 import requests
 import pandas as pd
 import streamlit as st
+import os
 
 
 # ----------------------------
@@ -15,7 +16,7 @@ st.set_page_config(
 )
 
 # AOHI API base – we keep it simple and local
-API_BASE = "http://127.0.0.1:8000"
+API_BASE = os.getenv("AOHI_API_BASE", "http://127.0.0.1:8000")
 
 
 # ----------------------------
